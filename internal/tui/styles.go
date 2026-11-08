@@ -43,7 +43,7 @@ var (
 
 	diffHighlight = lipgloss.NewStyle().
 			Foreground(lipgloss.AdaptiveColor{Light: "#7F1D1D", Dark: "#FECACA"}).
-			Background(lipgloss.AdaptiveColor{Light: "#FEE2E2", Dark: "#7F1D1D"})
+			Background(lipgloss.AdaptiveColor{Light: "#FEF2F2", Dark: "#7A3B3B"})
 )
 
 func verdictStyle(v string) lipgloss.Style {

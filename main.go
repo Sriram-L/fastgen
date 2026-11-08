@@ -15,6 +15,7 @@ import (
 
 	"fastgen/internal/compile"
 	"fastgen/internal/runner"
+	"fastgen/internal/spec"
 	"fastgen/internal/store"
 	"fastgen/internal/tui"
 )
@@ -35,9 +36,8 @@ type options struct {
 	saveDir   string
 	plain     bool
 
-	cxx      string
-	cxxflags string
-	sanitize bool
+	specPath string
+	compile  compile.Config
 }
 
 func main() {
@@ -54,7 +54,7 @@ func main() {
 		os.Exit(runPlain(ctx, opts))
 	}
 
-	compileCfg := compileConfig(opts)
+	compileCfg := opts.compile
 	m := tui.New(ctx, tui.Options{
 		Solution:  opts.solution,
 		Generator: opts.generator,
@@ -82,6 +82,13 @@ func parseFlags() (options, error) {
 	var opts options
 	defaults := compile.DefaultConfig()
 
+	var (
+		cxx      string
+		cxxflags string
+		sanitize bool
+	)
+
+	flag.StringVar(&opts.specPath, "spec", "", "YAML config file (default: config.yaml next to the executable)")
 	flag.StringVar(&opts.solution, "sol", "", "solution source file (required)")
 	flag.StringVar(&opts.generator, "gen", "", "test generator source file (required)")
 	flag.StringVar(&opts.brute, "brute", "", "brute force / correct solution source file (required)")
@@ -96,15 +103,16 @@ func parseFlags() (options, error) {
 	flag.StringVar(&opts.saveDir, "save-dir", "", "save failing cases to this directory")
 	flag.BoolVar(&opts.plain, "plain", false, "no TUI; print one line per test (good for CI)")
 
-	flag.StringVar(&opts.cxx, "cxx", defaults.CXX, "C++ compiler")
-	flag.StringVar(&opts.cxxflags, "cxxflags", strings.Join(defaults.Flags, " "), "compiler flags (space separated)")
-	flag.BoolVar(&opts.sanitize, "sanitize", false, "build the solution with -fsanitize=address,undefined")
+	flag.StringVar(&cxx, "cxx", defaults.CXX, "compiler command (overrides spec)")
+	flag.StringVar(&cxxflags, "cxxflags", strings.Join(defaults.Flags, " "), "compiler flags (space separated; overrides spec)")
+	flag.BoolVar(&sanitize, "sanitize", false, "build the solution with the spec's sanitizer flags")
 
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), `fastgen - stress-test a C++ solution against a brute force
+		fmt.Fprintf(flag.CommandLine.Output(), `fastgen - stress-test a solution against a brute force
 
 Usage:
   fastgen --sol a.cpp --gen gen.cpp --brute brute.cpp -n 1000
+  fastgen --spec config.yaml
 
 Options:
 `)
@@ -113,18 +121,130 @@ Options:
 The generator receives the seed as its first argument. Solutions read the
 input on stdin and are compared to the brute force output.
 
+Config file:
+  By default fastgen loads config.yaml from the directory containing the
+  fastgen binary. Use --spec to point at a different file. Command-line flags
+  override values from the config.
+
+  compile:
+    language: c++
+    flags: ["-std=c++17", "-O2", "-Wall"]
+    sanitize_flags: ["-fsanitize=address,undefined"]
+    command: ["{compiler}", "{flags}", "{source}", "-o", "{output}"]
+    # compiler: /path/to/compiler
+
+  defaults:
+    tests: 1000
+    seed: 1
+    timeout: 2s
+    jobs: 1
+    max_output: 4194304
+    exact: false
+    keep_going: false
+    sanitize: false
+    save_dir: ""
+
+  compile.language presets: c++, c, rust, go. Omit compile.compiler to use the
+  preset's compiler (including fastgen's local g++ detection). compile.command
+  may be a string or list and supports {compiler}, {flags}, {source}/{src},
+  {output}/{out}.
+
 Examples:
   fastgen --sol sol.cpp --gen gen.cpp --brute brute.cpp -n 5000 --jobs 4
   fastgen --sol sol.cpp --gen gen.cpp --brute brute.cpp --plain --save-dir fails
   fastgen --sol sol.cpp --gen gen.cpp --brute brute.cpp --keep-going --exact
+  fastgen --spec ../other-problem/config.yaml
 `)
 	}
 
 	flag.Parse()
 
+	set := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
 	if flag.NArg() > 0 {
 		return opts, fmt.Errorf("unexpected arguments: %s", strings.Join(flag.Args(), " "))
 	}
+
+	explicitSpec := opts.specPath != ""
+	specPath := opts.specPath
+	if !explicitSpec {
+		specPath = spec.DefaultPath()
+	}
+	var sp spec.Spec
+	if specPath != "" {
+		loaded, err := spec.Load(specPath)
+		if err != nil {
+			if !explicitSpec && errors.Is(err, os.ErrNotExist) {
+				// No config.yaml next to the binary; use built-in defaults.
+			} else {
+				return opts, err
+			}
+		} else {
+			sp = loaded
+			opts.specPath = specPath
+		}
+	}
+
+	if sp.Defaults.Tests != nil && !set["n"] {
+		opts.tests = *sp.Defaults.Tests
+	}
+	if sp.Defaults.Seed != nil && !set["seed"] {
+		opts.seed = *sp.Defaults.Seed
+	}
+	if sp.Defaults.Timeout != nil && !set["timeout"] {
+		opts.timeout = time.Duration(*sp.Defaults.Timeout)
+	}
+	if sp.Defaults.Exact != nil && !set["exact"] {
+		opts.exact = *sp.Defaults.Exact
+	}
+	if sp.Defaults.KeepGoing != nil && !set["keep-going"] {
+		opts.keepGoing = *sp.Defaults.KeepGoing
+	}
+	if sp.Defaults.Jobs != nil && !set["jobs"] {
+		opts.jobs = *sp.Defaults.Jobs
+	}
+	if sp.Defaults.MaxOutput != nil && !set["max-output"] {
+		opts.maxOutput = *sp.Defaults.MaxOutput
+	}
+	if sp.Defaults.SaveDir != nil && !set["save-dir"] {
+		opts.saveDir = *sp.Defaults.SaveDir
+	}
+	if sp.Defaults.Sanitize != nil && !set["sanitize"] {
+		sanitize = *sp.Defaults.Sanitize
+	}
+
+	cfg := defaults
+	language := strings.TrimSpace(sp.Compile.Language)
+	if language != "" {
+		if preset, ok := compile.Preset(language); ok {
+			cfg = preset
+		} else if sp.Compile.Compiler == nil && sp.Compile.Command == nil {
+			return opts, fmt.Errorf("spec %s: unknown compile.language %q (supported: %s)",
+				specPath, language, strings.Join(compile.Languages(), ", "))
+		}
+	}
+	if sp.Compile.Compiler != nil {
+		cfg.CXX = *sp.Compile.Compiler
+	}
+	if sp.Compile.Flags != nil {
+		cfg.Flags = append([]string{}, (*sp.Compile.Flags)...)
+	}
+	if sp.Compile.SanitizeFlags != nil {
+		cfg.SanitizeFlags = append([]string{}, (*sp.Compile.SanitizeFlags)...)
+	}
+	if sp.Compile.Command != nil {
+		cfg.Command = append([]string{}, (*sp.Compile.Command)...)
+	}
+	if set["cxx"] {
+		cfg.CXX = cxx
+	}
+	if set["cxxflags"] {
+		cfg.Flags = strings.Fields(cxxflags)
+	}
+	cfg.Sanitize = sanitize
+	opts.compile = cfg
+
 	if opts.solution == "" || opts.generator == "" || opts.brute == "" {
 		flag.Usage()
 		return opts, errors.New("--sol, --gen, and --brute are required")
@@ -144,14 +264,6 @@ Examples:
 	return opts, nil
 }
 
-func compileConfig(opts options) compile.Config {
-	cfg := compile.DefaultConfig()
-	cfg.CXX = opts.cxx
-	cfg.Flags = strings.Fields(opts.cxxflags)
-	cfg.Sanitize = opts.sanitize
-	return cfg
-}
-
 func runnerConfig(opts options, bins compile.Binaries) runner.Config {
 	return runner.Config{
 		Generator: bins.Generator,
@@ -169,7 +281,7 @@ func runnerConfig(opts options, bins compile.Binaries) runner.Config {
 }
 
 func runPlain(ctx context.Context, opts options) int {
-	bins, err := compile.Build(ctx, compileConfig(opts), compile.Targets{
+	bins, err := compile.Build(ctx, opts.compile, compile.Targets{
 		Solution:  opts.solution,
 		Generator: opts.generator,
 		Brute:     opts.brute,

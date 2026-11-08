@@ -18,7 +18,24 @@ type Config struct {
 	CXX      string
 	Flags    []string
 	Sanitize bool
+	// SanitizeFlags are appended to Flags when Sanitize is set. A nil slice
+	// uses the built-in C/C++ sanitizer flags; an empty non-nil slice disables
+	// sanitizer flags for languages that do not support them.
+	SanitizeFlags []string
+	// Command is an argv template. It must contain {source} (or {src}) and
+	// {output} (or {out}). A bare {flags} token expands to all Flags. An empty
+	// slice is an error; a nil slice uses DefaultCommand.
+	Command  []string
 	CacheDir string
+}
+
+// DefaultCommand is the default compiler argv template.
+func DefaultCommand() []string {
+	return []string{"{compiler}", "{flags}", "{source}", "-o", "{output}"}
+}
+
+func defaultSanitizeFlags() []string {
+	return []string{"-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"}
 }
 
 // Targets are the three source files fastgen needs.
@@ -72,13 +89,45 @@ func DefaultConfig() Config {
 	}
 
 	return Config{
-		CXX:      cxx,
-		Flags:    []string{"-std=c++17", "-O2", "-Wall"},
-		CacheDir: filepath.Join(cache, "fastgen"),
+		CXX:           cxx,
+		Flags:         []string{"-std=c++17", "-O2", "-Wall"},
+		SanitizeFlags: defaultSanitizeFlags(),
+		Command:       DefaultCommand(),
+		CacheDir:      filepath.Join(cache, "fastgen"),
 	}
 }
 
-var sanitizeFlags = []string{"-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"}
+// Languages returns the built-in language names accepted by Preset.
+func Languages() []string {
+	return []string{"c++", "c", "rust", "go"}
+}
+
+// Preset returns a compile setup for a supported language.
+func Preset(language string) (Config, bool) {
+	switch strings.ToLower(strings.TrimSpace(language)) {
+	case "c++", "cpp", "cxx":
+		return DefaultConfig(), true
+	case "c":
+		cfg := DefaultConfig()
+		cfg.CXX = "gcc"
+		cfg.Flags = []string{"-std=c17", "-O2", "-Wall"}
+		return cfg, true
+	case "rust":
+		cfg := DefaultConfig()
+		cfg.CXX = "rustc"
+		cfg.Flags = []string{"-O"}
+		cfg.SanitizeFlags = []string{}
+		return cfg, true
+	case "go":
+		cfg := DefaultConfig()
+		cfg.CXX = "go"
+		cfg.Flags = []string{}
+		cfg.SanitizeFlags = []string{}
+		cfg.Command = []string{"{compiler}", "build", "{flags}", "-o", "{output}", "{source}"}
+		return cfg, true
+	}
+	return Config{}, false
+}
 
 // Build compiles all targets in parallel, reusing cached binaries for
 // unchanged sources.
@@ -88,15 +137,26 @@ func Build(ctx context.Context, cfg Config, targets Targets) (Binaries, error) {
 	if cfg.CXX == "" {
 		cfg.CXX = "g++"
 	}
-	if _, err := exec.LookPath(cfg.CXX); err != nil {
-		return out, &CompileError{
-			File:   cfg.CXX,
-			Output: fmt.Sprintf("compiler %q not found on PATH (install g++ or pass --cxx)", cfg.CXX),
-			Err:    err,
-		}
-	}
 	if cfg.CacheDir == "" {
 		cfg.CacheDir = DefaultConfig().CacheDir
+	}
+	if cfg.SanitizeFlags == nil {
+		cfg.SanitizeFlags = defaultSanitizeFlags()
+	}
+	if cfg.Command == nil {
+		cfg.Command = DefaultCommand()
+	}
+	if err := validateCommand(cfg.Command); err != nil {
+		return out, err
+	}
+	probe := expandCommand(cfg.Command, cfg.CXX, cfg.Flags, "SOURCE", "OUTPUT")
+	exe := probe[0]
+	if _, err := exec.LookPath(exe); err != nil {
+		return out, &CompileError{
+			File:   exe,
+			Output: fmt.Sprintf("compiler %q not found on PATH (install it or set compile.compiler/compile.command in --spec)", exe),
+			Err:    err,
+		}
 	}
 	if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
 		return out, fmt.Errorf("create compile cache: %w", err)
@@ -144,13 +204,15 @@ func buildOne(ctx context.Context, cfg Config, file string, sanitize bool, dst *
 
 	flags := append([]string{}, cfg.Flags...)
 	if sanitize {
-		flags = append(flags, sanitizeFlags...)
+		flags = append(flags, cfg.SanitizeFlags...)
 	}
 
 	h := sha256.New()
 	h.Write([]byte(cfg.CXX))
 	h.Write([]byte{0})
 	h.Write([]byte(strings.Join(flags, "\x00")))
+	h.Write([]byte{0})
+	h.Write([]byte(strings.Join(cfg.Command, "\x00")))
 	h.Write([]byte{0})
 	h.Write(src)
 	key := hex.EncodeToString(h.Sum(nil))[:32]
@@ -169,10 +231,9 @@ func buildOne(ctx context.Context, cfg Config, file string, sanitize bool, dst *
 	tmp.Close()
 	defer os.Remove(tmpPath)
 
-	args := append([]string{}, flags...)
-	args = append(args, file, "-o", tmpPath)
+	args := expandCommand(cfg.Command, cfg.CXX, flags, file, tmpPath)
 
-	cmd := exec.CommandContext(ctx, cfg.CXX, args...)
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return &CompileError{File: file, Args: args, Output: string(output), Err: err}
@@ -190,6 +251,45 @@ func buildOne(ctx context.Context, cfg Config, file string, sanitize bool, dst *
 	}
 	*dst = bin
 	return nil
+}
+
+func validateCommand(command []string) error {
+	if len(command) == 0 {
+		return errors.New("compile command is empty")
+	}
+	var source, output bool
+	for _, token := range command {
+		if strings.Contains(token, "{source}") || strings.Contains(token, "{src}") {
+			source = true
+		}
+		if strings.Contains(token, "{output}") || strings.Contains(token, "{out}") {
+			output = true
+		}
+	}
+	if !source || !output {
+		return fmt.Errorf("compile command must contain {source} and {output}: %q", strings.Join(command, " "))
+	}
+	return nil
+}
+
+func expandCommand(command []string, compiler string, flags []string, source, output string) []string {
+	replacer := strings.NewReplacer(
+		"{compiler}", compiler,
+		"{source}", source,
+		"{src}", source,
+		"{output}", output,
+		"{out}", output,
+		"{flags}", strings.Join(flags, " "),
+	)
+	args := make([]string, 0, len(command)+len(flags))
+	for _, token := range command {
+		if token == "{flags}" {
+			args = append(args, flags...)
+			continue
+		}
+		args = append(args, replacer.Replace(token))
+	}
+	return args
 }
 
 // IsCompileError reports whether err came from the compiler.

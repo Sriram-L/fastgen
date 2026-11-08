@@ -1,0 +1,23 @@
+# fastgen config.
+#
+# By default this file is loaded from the directory that contains the fastgen
+# binary. Use --spec to load it from somewhere else. Command-line flags override
+# values in this file.
+
+compile:
+  language: c++
+  # compiler: /path/to/compiler   # omit to use the language preset
+  flags: ["-std=c++17", "-O2", "-Wall"]
+  sanitize_flags: ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]
+  command: ["{compiler}", "{flags}", "{source}", "-o", "{output}"]
+
+defaults:
+  tests: 1000
+  seed: 1
+  timeout: 2s
+  jobs: 4
+  max_output: 4194304
+  exact: false
+  keep_going: false
+  sanitize: false
+  save_dir: ""
